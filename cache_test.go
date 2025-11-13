@@ -20,8 +20,10 @@ import (
 	"fmt"
 	"hash/maphash"
 	"math/rand/v2"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 )
 
@@ -340,6 +342,200 @@ func TestSerializeComplexCache(t *testing.T) {
 	}
 
 	t.Logf("Successfully verified %d entries preserved after serialization/deserialization", len(expectedEntries))
+}
+
+// TestRaceEntryAlreadyDeleted attempts to reproduce the "entry already deleted" panic
+// by creating high contention on a small cache with rapid insertions and evictions.
+func TestRaceEntryAlreadyDeleted(t *testing.T) {
+	const (
+		// Use a very small cache to force frequent evictions
+		slotSize  = 16
+		mCapacity = 50
+		sCapacity = 10
+
+		// Number of concurrent goroutines
+		goroutines = 32
+
+		// Operations per goroutine
+		operations = 10000
+
+		// Small key space to force hash collisions and reuse
+		keySpace = 100
+	)
+
+	c := newCache(t, slotSize, mCapacity, sCapacity)
+
+	var (
+		wg       sync.WaitGroup
+		counter  atomic.Uint64
+		failures atomic.Uint64
+	)
+
+	// Pre-fill the cache to ensure evictions happen immediately
+	for i := 0; i < mCapacity+sCapacity; i++ {
+		key := fmt.Sprintf("prefill-%d", i)
+		c.Set(key, []byte(key))
+	}
+
+	t.Logf("Starting high contention test with %d goroutines", goroutines)
+
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+
+			for i := 0; i < operations; i++ {
+				idx := counter.Add(1)
+
+				// Use a small key space to force entry slot reuse
+				keyIdx := idx % keySpace
+				key := fmt.Sprintf("key-%d", keyIdx)
+				value := []byte(fmt.Sprintf("value-%d-%d", id, i))
+
+				// Try to insert - this will trigger evictions
+				err := c.Set(key, value)
+				if err == ErrAlreadyExists {
+					// Expected when keys collide
+					failures.Add(1)
+					continue
+				} else if err != nil {
+					t.Errorf("unexpected error: %v", err)
+					return
+				}
+
+				// Occasionally do a Get to trigger access patterns
+				if i%3 == 0 {
+					c.Get(key, nil)
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	total := counter.Load()
+	failed := failures.Load()
+	t.Logf("Completed %d operations (%d collisions)", total, failed)
+}
+
+// TestRaceEntryReuseDuringEviction tries to hit the specific window where:
+// 1. An entry slot is allocated and metadata is set
+// 2. But the hashmap hasn't been updated yet
+// 3. Another thread tries to evict that slot
+func TestRaceEntryReuseDuringEviction(t *testing.T) {
+	const (
+		slotSize   = 16
+		mCapacity  = 20
+		sCapacity  = 5
+		goroutines = 16
+		duration   = 2 * time.Second
+	)
+
+	c := newCache(t, slotSize, mCapacity, sCapacity)
+
+	// Pre-fill to trigger immediate evictions
+	for i := 0; i < mCapacity+sCapacity; i++ {
+		c.Set(fmt.Sprintf("prefill-%d", i), []byte(fmt.Sprintf("value-%d", i)))
+	}
+
+	var (
+		stop    atomic.Bool
+		wg      sync.WaitGroup
+		counter atomic.Uint64
+	)
+
+	t.Logf("Running race test for %v", duration)
+
+	// Inserter goroutines - cause evictions
+	for g := 0; g < goroutines/2; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			var localCounter uint64
+			for !stop.Load() {
+				key := fmt.Sprintf("insert-%d-%d", id, localCounter)
+				// Use varying sizes to cause different slot allocations
+				valueSize := 8 + (localCounter%3)*8
+				value := make([]byte, valueSize)
+				c.Set(key, value)
+				localCounter++
+				counter.Add(1)
+			}
+		}(g)
+	}
+
+	// Reader goroutines - trigger access and promotions
+	for g := goroutines / 2; g < goroutines; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			var localCounter uint64
+			for !stop.Load() {
+				// Try to read recent keys
+				key := fmt.Sprintf("insert-%d-%d", id%(goroutines/2), localCounter%100)
+				c.Get(key, nil)
+				localCounter++
+
+				// Also insert occasionally to maintain pressure
+				if localCounter%5 == 0 {
+					newKey := fmt.Sprintf("read-insert-%d-%d", id, localCounter)
+					c.Set(newKey, []byte(newKey))
+					counter.Add(1)
+				}
+			}
+		}(g)
+	}
+
+	time.Sleep(duration)
+	stop.Store(true)
+	wg.Wait()
+
+	ops := counter.Load()
+	t.Logf("Completed %d operations in %v (%d ops/sec)", ops, duration, ops/uint64(duration.Seconds()))
+}
+
+// TestRaceDoubleEviction attempts to trigger a scenario where the same entry
+// could be evicted twice from different queues
+func TestRaceDoubleEviction(t *testing.T) {
+	const (
+		slotSize   = 16
+		mCapacity  = 30
+		sCapacity  = 10
+		goroutines = 8
+		rounds     = 1000
+	)
+
+	for round := 0; round < rounds; round++ {
+		c := newCache(t, slotSize, mCapacity, sCapacity)
+
+		var wg sync.WaitGroup
+
+		// Fill cache exactly to capacity
+		for i := 0; i < mCapacity+sCapacity; i++ {
+			key := fmt.Sprintf("key-%d", i)
+			c.Set(key, []byte(key))
+			// Access twice to promote to m-queue
+			c.Get(key, nil)
+			c.Get(key, nil)
+		}
+
+		// Now cause rapid evictions with many goroutines
+		for g := 0; g < goroutines; g++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				for i := 0; i < 100; i++ {
+					key := fmt.Sprintf("new-%d-%d", id, i)
+					c.Set(key, []byte(key))
+				}
+			}(g)
+		}
+
+		wg.Wait()
+		c.Close()
+	}
+
+	t.Logf("Completed %d rounds without panic", rounds)
 }
 
 func keySlots(seed maphash.Seed, key int, maxSlots int) int {
