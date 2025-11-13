@@ -2,7 +2,7 @@ name: Go
 
 on:
   push:
-    branches: ["main"]
+    branches: ["main", "fix-race"]
   pull_request:
     branches: ["main"]
 
@@ -24,4 +24,4 @@ jobs:
         run: go test -v -short ./...
 
       - name: Test Race
-        run: go test -v -short -race ./...
+        run: go test -v -short -race -count=20 ./...
