@@ -110,10 +110,10 @@ type cache struct {
 	data []byte
 
 	// Entries
-	eSize   []int32
+	eSize   []atomic.Int32
 	eAccess []atomic.Int32
 	eFreq   []atomic.Int32
-	eHash   []uint64
+	eHash   []atomic.Uint64
 
 	// Policy
 	m, s *queue[int32]
@@ -157,10 +157,10 @@ func NewEx(slotSize, mCap, sCap int32) Cache {
 
 	c := &cache{
 		data:     make([]byte, int(slotCap)*int(slotSize)),
+		eSize:    make([]atomic.Int32, slotCap),
 		eAccess:  make([]atomic.Int32, slotCap),
 		eFreq:    make([]atomic.Int32, slotCap),
-		eSize:    make([]int32, slotCap),
-		eHash:    make([]uint64, slotCap),
+		eHash:    make([]atomic.Uint64, slotCap),
 		seed:     maphash.MakeSeed(),
 		m:        newQueue[int32](int(mCap)),
 		s:        newQueue[int32](int(sCap)),
@@ -247,14 +247,16 @@ func (c *cache) set(hash uint64, val []byte, frequency int32, useMQueue bool) er
 		}
 	}
 
-	c.eAccess[first].Store(0)
 	c.eFreq[first].Store(frequency)
-	c.eSize[first] = size
-	c.eHash[first] = hash
+	c.eSize[first].Store(size)
+	c.eHash[first].Store(hash)
 
 	c.size.Add(uint64(size))
 
 	c.hashmap.Store(hash, first)
+
+	// Keep this last, since it will unlock reads on this entry.
+	c.eAccess[first].Store(0)
 
 	var enqRes enqueueResult
 	if useMQueue || c.g.In(hash) {
@@ -297,6 +299,20 @@ func (c *cache) get(hash uint64, dst []byte) []byte {
 
 	if c.eAccess[e].Add(1) < 0 {
 		c.eAccess[e].Store(math.MinInt32)
+		return nil
+	}
+
+	// Sanity check under the bounds of c.eAccess: verify hash matches
+	// This detects if the slot was reallocated between hashmap.Load and eAccess.Add
+	if c.eHash[e].Load() != hash {
+		c.eAccess[e].Add(-1)
+		return nil
+	}
+
+	// Window 1 fix: Re-verify hashmap still points to this entry
+	// If entry was evicted and reallocated, hashmap will point elsewhere
+	if e2, ok := c.hashmap.Load(hash); !ok || e2 != e {
+		c.eAccess[e].Add(-1)
 		return nil
 	}
 
@@ -348,7 +364,7 @@ func (c *cache) evictS() {
 			continue
 		}
 
-		slots := int64(cost(c.slotSize, c.eSize[entry]))
+		slots := int64(cost(c.slotSize, c.eSize[entry].Load()))
 
 		c.sSize.Add(-slots)
 
@@ -357,7 +373,7 @@ func (c *cache) evictS() {
 		// it will have a frequency of 1 and it will still get promoted
 		// to the m-queue.
 		if c.eFreq[entry].Load() <= 1 && c.eAccess[entry].CompareAndSwap(0, math.MinInt32) {
-			c.g.Add(c.eHash[entry])
+			c.g.Add(c.eHash[entry].Load())
 			c.evictEntry(entry)
 			return
 		}
@@ -386,7 +402,7 @@ func (c *cache) evictM() {
 			continue
 		}
 
-		slots := int64(cost(c.slotSize, c.eSize[entry]))
+		slots := int64(cost(c.slotSize, c.eSize[entry].Load()))
 
 		c.mSize.Add(-slots)
 
@@ -416,17 +432,18 @@ func (c *cache) evictM() {
 }
 
 func (c *cache) evictEntry(e int32) {
-	if prev, ok := c.hashmap.LoadAndDelete(c.eHash[e]); !ok || e != prev {
+	if prev, ok := c.hashmap.LoadAndDelete(c.eHash[e].Load()); !ok || e != prev {
 		panic("otto: invariant violated: entry already deleted")
 	}
 
-	if c.eSize[e] < 1 {
+	size := c.eSize[e].Load()
+	if size < 1 {
 		panic("otto: invariant violated: entry with size zero")
 	}
 
-	c.size.Add(^uint64(c.eSize[e] - 1))
+	c.size.Add(^uint64(size - 1))
 
-	slots := cost(c.slotSize, c.eSize[e])
+	slots := cost(c.slotSize, size)
 
 	prev := e
 
@@ -445,7 +462,7 @@ func (c *cache) evictEntry(e int32) {
 }
 
 func (c *cache) read(e int32, dst []byte) []byte {
-	size := c.eSize[e]
+	size := c.eSize[e].Load()
 	if cap(dst) < int(size) {
 		dst = make([]byte, size)
 	} else {
