@@ -105,7 +105,7 @@ func (c *cache) serializeQueue(e *gob.Encoder, q *queue[int32]) error {
 		entry := serializedEntryV101{
 			Value: c.read(entryIdx, nil),
 			Freq:  c.eFreq[entryIdx].Load(),
-			Hash:  c.eHash[entryIdx],
+			Hash:  c.eHash[entryIdx].Load(),
 		}
 
 		if err := e.Encode(entry); err != nil {
